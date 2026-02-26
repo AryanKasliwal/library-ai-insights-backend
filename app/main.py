@@ -10,6 +10,24 @@ from dotenv import load_dotenv
 load_dotenv()
 
 
+def download_file_from_s3(filename):
+    s3 = boto3.client(
+        "s3",
+        region_name=os.environ["AWS_REGION"],
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+    )
+
+    if not os.path.exists(filename):
+        print(f"⬇️ Downloading {filename} from S3...")
+        s3.download_file(
+            os.environ["S3_BUCKET"],
+            filename,
+            filename
+        )
+        print(f"✅ {filename} downloaded.")
+
+
 def download_vector_store():
     if os.path.exists("vector_store"):
         print("📦 Vector store already exists locally.")
@@ -46,6 +64,7 @@ async def lifespan(app: FastAPI):
     # Initialize book store with enriched data and recommendations
     from app.api.books_api import init_book_store
     try:
+        download_file_from_s3("book_recommendations.json")
         download_vector_store()
         init_book_store(
             csv_path="app/data/csv/enriched_books_filtered.csv",
