@@ -36,3 +36,4 @@ htmlcov/
 # Optional: ignore local runner
 run.py
 .env
+app/services/book_recommendations.json
