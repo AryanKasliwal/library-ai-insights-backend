@@ -115,3 +115,8 @@ app.include_router(books_api.router, prefix="/books", tags=["Books"])
 def health_check():
     """Health check endpoint."""
     return {"status": "ok", "service": "library-ai-insights"}
+
+# Allow HEAD requests for /health (for monitoring compatibility)
+@app.head("/health")
+def health_head():
+    return {"status": "ok", "service": "library-ai-insights"}
