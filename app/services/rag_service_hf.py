@@ -4,18 +4,30 @@ from sentence_transformers import SentenceTransformer
 from huggingface_hub import InferenceClient
 import os
 import re
+import warnings
 from dotenv import load_dotenv
 from app.services.utils import normalize_to_filename
 
 load_dotenv()
 
+warnings.filterwarnings(
+    "ignore",
+    message="`resume_download` is deprecated",
+    category=FutureWarning,
+)
+
 class RAGServiceHF:
     def __init__(self):
-        self.model = SentenceTransformer("all-MiniLM-L6-v2")
+        self.model = None
         self.llm = InferenceClient(
             token=os.environ.get("HF_READ_KEY"),
             model="openai/gpt-oss-20b"
         )
+
+    def _get_embedding_model(self):
+        if self.model is None:
+            self.model = SentenceTransformer("all-MiniLM-L6-v2")
+        return self.model
 
     def load_index(self, book_id):
         index_path = f"vector_store/{book_id}.index"
@@ -109,7 +121,7 @@ If no chunks are essential, return an empty list: []
         return [chunks_with_indices[i] for i in relevant_indices if i < len(chunks_with_indices)]
 
     def search_chunks(self, question, index, chunks, k=20):
-        q_embedding = self.model.encode([question])
+        q_embedding = self._get_embedding_model().encode([question])
         distances, indices = index.search(np.array(q_embedding), k)
 
         results = []
@@ -138,7 +150,7 @@ If no chunks are essential, return an empty list: []
         history_text = ""
         if chat_history:
             history_lines = []
-            for msg in chat_history[-6:]:
+            for msg in chat_history[-10:]:
                 role = "User" if msg["role"] == "user" else "Assistant"
                 history_lines.append(f"{role}: {msg['message']}")
             history_text = "\n".join(history_lines)
@@ -146,9 +158,11 @@ If no chunks are essential, return an empty list: []
         length_instruction = self._length_instruction(question)
 
         return f"""You are a research assistant helping a user understand the book "{book_name}".
-            Answer the user's question based ONLY on the provided book excerpts below.
-            If the answer is not found in the excerpts, say so clearly.
+            Answer the user's question based ONLY on the provided book excerpts below and the chat history.
+            If the answer is not found in the excerpts and chat history, say so clearly.
             Be accurate and directly address the user's intent.
+            Use the conversation history to interpret follow-up questions and references like "this", "that", or "as discussed earlier".
+            If earlier chat messages provide needed context, explicitly incorporate that context into the answer.
             {length_instruction}
 
             Writing rules:

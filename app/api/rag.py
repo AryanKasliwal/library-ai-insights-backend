@@ -1,10 +1,8 @@
 from fastapi import APIRouter, Request
 from pydantic import BaseModel
-from app.services.rag_service import rag_service
 from app.services.rag_service_hf import rag_service_hf
 from app.services.utils import normalize_to_filename
 import os
-import random
 
 
 router = APIRouter()
@@ -48,7 +46,6 @@ def get_session_id(request: Request):
 
 
 # Chat logic only (no endpoints)
-from app.services.rag_service import rag_service
 from app.services.utils import normalize_to_filename
 
 def store_and_reply(session_id: str, book_name: str, msg: str):
@@ -62,8 +59,7 @@ def store_and_reply(session_id: str, book_name: str, msg: str):
     history = chat_histories[session_id][normalized_book]
     history.append({"role": "user", "message": msg})
 
-    # Call RAG with chat history
-    # result = rag_service.query(normalized_book, msg, chat_history=history)
+    # Call HF RAG with chat history
     result = rag_service_hf.query(normalized_book, msg, chat_history=history)
 
     history.append({
@@ -91,14 +87,12 @@ def rag_query(payload: QueryRequest):
     if not os.path.exists(pdf_path):
         return {"error": f"PDF not found for {payload.bookId}"}
 
-    results = rag_service.query(normalized_name, payload.question)
+    result = rag_service_hf.query(normalized_name, payload.question)
 
-    if results is None:
+    if not result:
         return {"error": "Index not built yet"}
 
     return {
-        "answer": results[0],
-        "sources": [
-            {"text": r, "page": None} for r in results
-        ]
+        "answer": result.get("answer", ""),
+        "sources": result.get("sources", [])
     }
