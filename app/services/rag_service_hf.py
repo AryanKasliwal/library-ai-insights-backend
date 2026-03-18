@@ -27,13 +27,12 @@ class RAGServiceHF:
             token=os.environ.get("HF_READ_KEY"),
             model="openai/gpt-oss-20b"
         )
-
-        # ✅ NEW: embedding client (HF API)
+        # Use new HF router for embeddings
         self.embed_client = InferenceClient(
-            token=os.environ.get("HF_READ_KEY")
+            token=os.environ.get("HF_READ_KEY"),
+            provider="hf-inference"
         )
 
-    # ✅ NEW: embedding via HF API (cached)
     @lru_cache(maxsize=1000)
     def _get_query_embedding(self, text: str):
         embedding = self.embed_client.feature_extraction(
