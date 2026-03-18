@@ -1,6 +1,5 @@
 # Large data directories - downloaded at runtime from S3
 app/data/pdfs/
-app/data/csv/
 vector_store/
 
 # Archive files
