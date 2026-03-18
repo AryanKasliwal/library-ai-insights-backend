@@ -7,16 +7,102 @@ Endpoints:
 - GET /api/stats - Get system statistics
 """
 
-from fastapi import APIRouter, Query, HTTPException
+
+from fastapi import APIRouter, Query, HTTPException, Request
 from typing import List, Optional, Dict
-from app.services.book_store import BookStore
+from pydantic import BaseModel
+from app.api.rag import ChatMessage, get_session_id, store_and_reply, clear_history, get_chat_from_history
 import os
 import difflib
+from app.services.book_store import BookStore
+from app.services.utils import normalize_to_filename
 
 router = APIRouter(tags=["books"])
-
 # Global book store (initialized at app startup)
+
+import boto3
+from botocore.exceptions import ClientError
+
+S3_BUCKET = os.environ.get("S3_BUCKET")
+S3_PREFIX = os.environ.get("S3_Bucket", "pdfs/")  # folder inside bucket if any
+
+
+from fastapi.responses import FileResponse
+import glob
+
+PDF_DIR = "app/data/pdfs"
+
+@router.get("/pdf/{book_name}")
+def serve_pdf(book_name: str):
+    """Serve PDF file directly from local storage."""
+    book_saved_name = normalize_to_filename(book_name)
+    print(book_saved_name)
+    pdf_path = f"{PDF_DIR}/{book_saved_name}.pdf"
+    
+    if not os.path.exists(pdf_path):
+        # Try to find it with glob in case casing differs
+        matches = glob.glob(f"{PDF_DIR}/{book_saved_name}*.pdf")
+        if matches:
+            pdf_path = matches[0]
+        else:
+            raise HTTPException(status_code=404, detail=f"PDF not found for {book_name}")
+    
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={book_name}.pdf"}
+    )
+
+
+def get_s3_client():
+    return boto3.client(
+        "s3",
+        aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+        aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+        region_name=os.environ.get("AWS_REGION", "us-east-1")
+    )
+
+@router.get("/pdf-url/{book_key}")
+def get_pdf_url(book_key: str):
+    """Returns a presigned S3 URL for the book PDF."""
+    s3 = get_s3_client()
+    s3_key = f"{S3_PREFIX}{book_key}.pdf"
+
+    try:
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": S3_BUCKET, "Key": s3_key},
+            ExpiresIn=3600  # 1 hour
+        )
+        return {"url": url}
+    except ClientError as e:
+        return {"url": None, "error": str(e)}
+
+# ============= Chat Endpoints =============
+
+@router.post("/chat")
+async def chat_endpoint(payload: ChatMessage, request: Request):
+    session_id = get_session_id(request)
+    bot_reply, sources, history = store_and_reply(session_id, payload.book_name, payload.message)
+    return {
+        "status": "ok",
+        "reply": bot_reply,
+        "sources": sources,
+        "history": history
+    }
+
+@router.post("/chat/clear")
+async def clear_chat_history(request: Request):
+    session_id = get_session_id(request)
+    clear_history(session_id)
+    return {"status": "cleared"}
 _store: Optional[BookStore] = None
+
+
+@router.get("/chat/history")
+async def get_chat_history(book_name: str, request: Request):
+    session_id = get_session_id(request)
+    return {"history": get_chat_from_history(session_id, book_name)}
 
 
 # ============= Pagination & Search Helpers =============
@@ -203,6 +289,23 @@ class BookResponse:
 
 # ============= API Endpoints =============
 
+# Endpoint: List books available for AI chat
+@router.get("/chat-books")
+def list_chat_books():
+    vector_store_path = "vector_store"
+    index_files = [f for f in os.listdir(vector_store_path) if f.endswith('.index')]
+    book_names = []
+    for fname in index_files:
+        name = fname.replace('.index', '')
+        name = name.lstrip('_')
+        name = name.replace('_', ' ')
+        # Remove leading '. ' if present
+        if name.startswith('. '):
+            name = name[2:]
+        book_names.append(name)
+    return {"books": book_names}
+
+
 @router.get("/search")
 def smart_search(
     q: Optional[str] = Query(None, description="Search query (title, author, category, or general)"),
@@ -325,12 +428,12 @@ def get_book(isbn: str):
 
 
 @router.get("/{isbn}/similar")
-def get_similar_books(isbn: str, limit: int = Query(50, ge=1, le=100)):
+def get_similar_books(isbn: str, limit: int = Query(100, ge=1, le=100)):
     """Get similar books for a given ISBN.
     
     Uses Jaccard similarity on categories + rating quality boost.
     
-    Example: GET /api/books/9780439785969/similar?limit=50
+    Example: GET /api/books/9780439785969/similar?limit=100
     """
     store = get_store()
     book = store.get_book(isbn)

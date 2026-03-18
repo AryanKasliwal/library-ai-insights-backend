@@ -1,20 +1,21 @@
 import faiss
 import numpy as np
 from sentence_transformers import SentenceTransformer
-import google.generativeai as genai
+from huggingface_hub import InferenceClient
 import os
 import re
 from dotenv import load_dotenv
+from app.services.utils import normalize_to_filename
 
 load_dotenv()
 
-# genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
-
-class RAGService:
+class RAGServiceHF:
     def __init__(self):
         self.model = SentenceTransformer("all-MiniLM-L6-v2")
-        genai.configure(api_key=os.environ.get("GOOGLE_API_KEY"))
-        self.gemini = genai.GenerativeModel("gemini-2.0-flash-lite")
+        self.llm = InferenceClient(
+            token=os.environ.get("HF_READ_KEY"),
+            model="openai/gpt-oss-20b"
+        )
 
     def load_index(self, book_id):
         index_path = f"vector_store/{book_id}.index"
@@ -89,8 +90,9 @@ If no chunks are essential, return an empty list: []
 --- RESPONSE (Python list only, no other text) ---"""
 
         try:
-            response = self.gemini.generate_content(eval_prompt)
-            response_text = response.text.strip()
+            messages = [{"role": "user", "content": eval_prompt}]
+            response = self.llm.chat_completion(messages, max_tokens=100)
+            response_text = response.choices[0].message.content.strip()
             # Parse the list from the response
             import ast
             relevant_indices = ast.literal_eval(response_text)
@@ -106,52 +108,33 @@ If no chunks are essential, return an empty list: []
         # Return only the relevant chunks
         return [chunks_with_indices[i] for i in relevant_indices if i < len(chunks_with_indices)]
 
-    def query(self, book_id, question, chat_history=[], k=20):
-        index, chunks = self.load_index(book_id)
-
-        if index is None:
-            return {
-                "answer": f"No index found for '{book_id}'. This book may not have AI research enabled.",
-                "sources": []
-            }
-
-        # Retrieve top k chunks (vector-based initial pass, no filtering)
+    def search_chunks(self, question, index, chunks, k=20):
         q_embedding = self.model.encode([question])
         distances, indices = index.search(np.array(q_embedding), k)
 
-        # Handle both old (plain string) and new (dict with page) chunk format
-        all_chunks = []
+        results = []
         for idx in indices[0]:
             if idx == -1:
                 continue
             chunk = chunks[idx]
             if isinstance(chunk, dict):
-                all_chunks.append({
+                results.append({
                     "text": chunk.get("text", ""),
                     "page": chunk.get("page", None),
                 })
             else:
-                all_chunks.append({
+                results.append({
                     "text": str(chunk),
                     "page": None,
                 })
+        return results
 
-        # Use LLM to filter for actual relevance
-        relevant_chunks = self._filter_by_llm_relevance(question, all_chunks)
-
-        if not relevant_chunks:
-            return {
-                "answer": "I couldn't find relevant content in this book for your question.",
-                "sources": []
-            }
-
-        # Build context from chunks
+    def build_prompt(self, book_name, chat_history, context_chunks, question):
         context_text = "\n\n".join(
             f"[Page {c['page']}]\n{c['text']}" if c['page'] else c['text']
-            for c in relevant_chunks
+            for c in context_chunks
         )
 
-        # Build chat history string (last 6 messages = 3 exchanges)
         history_text = ""
         if chat_history:
             history_lines = []
@@ -162,40 +145,68 @@ If no chunks are essential, return an empty list: []
 
         length_instruction = self._length_instruction(question)
 
-        # Build prompt
-        prompt = f"""You are a research assistant helping a user understand the book "{book_id}".
-Answer the user's question based ONLY on the provided book excerpts below and the chat history attached.
-If the answer is not found in the excerpts, say so clearly.
-    Be accurate and directly address the user's intent.
-    {length_instruction}
+        return f"""You are a research assistant helping a user understand the book "{book_name}".
+            Answer the user's question based ONLY on the provided book excerpts below.
+            If the answer is not found in the excerpts, say so clearly.
+            Be accurate and directly address the user's intent.
+            {length_instruction}
 
-    Writing rules:
-    - Do NOT mention page numbers, excerpt labels, source counts, or phrases like "as highlighted on page...".
-    - Do NOT reference the retrieval process (no "based on the excerpts above" in the final answer).
-    - Present the answer as clean factual prose tailored to the request.
+            Writing rules:
+            - Do NOT mention page numbers, excerpt labels, source counts, or phrases like "as highlighted on page...".
+            - Do NOT reference the retrieval process (no "based on the excerpts above" in the final answer).
+            - Present the answer as clean factual prose tailored to the request.
 
---- BOOK EXCERPTS ---
-{context_text}
+            --- BOOK EXCERPTS ---
+            {context_text}
 
---- CONVERSATION HISTORY ---
-{history_text if history_text else "No previous conversation."}
+            --- CONVERSATION HISTORY ---
+            {history_text if history_text else "No previous conversation."}
 
---- QUESTION ---
-{question}
+            --- QUESTION ---
+            {question}
 
---- ANSWER ---"""
+            --- ANSWER ---"""
 
-        # Call Gemini
+    def query(self, book_id, question, chat_history=[], k=20):
+        index, chunks = self.load_index(book_id)
+
+        if index is None:
+            return {
+                "answer": f"No index found for '{book_id}'. This book may not have AI research enabled.",
+                "sources": []
+            }
+
+        all_chunks = self.search_chunks(question, index, chunks, k)
+
+        # Use LLM to filter for actual relevance
+        relevant_chunks = self._filter_by_llm_relevance(question, all_chunks)
+
+        if not relevant_chunks:
+            return {
+                "answer": "I couldn't find relevant content in this book for your question.",
+                "sources": []
+            }
+
+        prompt = self.build_prompt(book_id, chat_history, relevant_chunks, question)
+
         try:
-            response = self.gemini.generate_content(prompt)
-            answer = response.text
+            messages = [{"role": "user", "content": prompt}]
+            full_response = ""
+            for msg in self.llm.chat_completion(
+                messages,
+                max_tokens=1024,
+                stream=True,
+            ):
+                if msg.choices and msg.choices[0].delta.content:
+                    full_response += msg.choices[0].delta.content
+            answer = full_response
         except Exception as e:
             return {
                 "answer": f"Error generating response: {str(e)}",
                 "sources": []
             }
 
-        # Only return sources that have page numbers
+
         sources = [
             {"text": c["text"], "page": c["page"]}
             for c in relevant_chunks
@@ -209,4 +220,4 @@ If the answer is not found in the excerpts, say so clearly.
         }
 
 
-rag_service = RAGService()
+rag_service_hf = RAGServiceHF()

@@ -9,6 +9,37 @@ import tarfile
 from dotenv import load_dotenv
 load_dotenv()
 
+def _get_s3_client():
+    return boto3.client(
+        "s3",
+        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
+        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
+        region_name=os.environ["AWS_REGION"],
+    )
+
+
+def download_pdfs_from_s3():
+    pdf_dir = "app/data/pdfs"
+
+    if os.path.exists(pdf_dir) and len(os.listdir(pdf_dir)) > 0:
+        print(f"📚 PDFs already exist locally ({len(os.listdir(pdf_dir))} files).")
+        return
+
+    print("⬇️ Downloading PDFs archive from S3...")
+    os.makedirs("app/data", exist_ok=True)
+
+    s3 = _get_s3_client()
+    bucket = os.environ["S3_BUCKET"]
+    s3.download_file(bucket, "pdfs.tar.gz", "pdfs.tar.gz")
+
+    print("📂 Extracting PDFs archive...")
+    with tarfile.open("pdfs.tar.gz", "r:gz") as tar:
+        tar.extractall(path="app/data")
+
+    os.remove("pdfs.tar.gz")
+
+    print("✅ PDFs ready.")
+
 
 def download_file_from_s3(filename):
     s3 = boto3.client(
@@ -35,12 +66,7 @@ def download_vector_store():
 
     print("⬇️ Downloading vector store from S3...")
 
-    s3 = boto3.client(
-        "s3",
-        aws_access_key_id=os.environ["AWS_ACCESS_KEY_ID"],
-        aws_secret_access_key=os.environ["AWS_SECRET_ACCESS_KEY"],
-        region_name=os.environ["AWS_REGION"],
-    )
+    s3 = _get_s3_client()
 
     bucket = os.environ["S3_BUCKET"]
 
@@ -60,12 +86,23 @@ async def lifespan(app: FastAPI):
     """Application lifecycle: startup and shutdown."""
     # Startup
     print("\n🚀 Starting Library AI Insights Backend...")
-    
+
+    # Run S3 bootstrap steps independently so one failure does not block others.
+    try:
+        download_vector_store()
+    except Exception as e:
+        print(f"⚠️ Warning: Vector store download failed: {e}")
+
+    try:
+        download_pdfs_from_s3()
+        print("✅ PDFs downloaded successfully")
+    except Exception as e:
+        print(f"⚠️ Warning: PDF download failed: {e}")
+
     # Initialize book store with enriched data and recommendations
     from app.api.books_api import init_book_store
     try:
         download_file_from_s3("book_recommendations.json")
-        download_vector_store()
         init_book_store(
             csv_path="app/data/csv/enriched_books_filtered.csv",
             recommendations_path="app/services/book_recommendations.json"

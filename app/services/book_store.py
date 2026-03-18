@@ -23,6 +23,8 @@ Usage:
 
 import csv
 import json
+import math
+import re
 import time
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -151,6 +153,75 @@ class BookStore:
         # Simple tokenization, lowercase, filter by length
         words = title.lower().split()
         return [w.strip('.,!?"\'') for w in words if len(w) >= min_length]
+
+    @staticmethod
+    def _safe_year(value) -> Optional[int]:
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    @staticmethod
+    def _tokenize_text(text: str) -> set:
+        if not text:
+            return set()
+        return set(re.findall(r"[a-z0-9]+", text.lower()))
+
+    def _rerank_similar_candidates(self, target_book: Dict, similar_data: List[Tuple[str, float]]) -> List[Tuple[str, float]]:
+        target_categories = set(self._parse_categories(target_book.get('categories', '')))
+        target_authors = set(self._parse_authors(target_book.get('authors', '')))
+        target_year = self._safe_year(target_book.get('published_year'))
+        target_title_tokens = set(self._extract_title_words(target_book.get('title', '')))
+        target_desc_tokens = self._tokenize_text(target_book.get('description', ''))
+
+        reranked = []
+        for sim_isbn, base_score in similar_data:
+            sim_book = self.books_by_isbn.get(sim_isbn)
+            if not sim_book:
+                continue
+
+            sim_categories = set(self._parse_categories(sim_book.get('categories', '')))
+            sim_authors = set(self._parse_authors(sim_book.get('authors', '')))
+            sim_year = self._safe_year(sim_book.get('published_year'))
+            sim_title_tokens = set(self._extract_title_words(sim_book.get('title', '')))
+            sim_desc_tokens = self._tokenize_text(sim_book.get('description', ''))
+
+            # Category overlap: strong genre alignment signal.
+            union_cats = target_categories | sim_categories
+            category_overlap = (len(target_categories & sim_categories) / len(union_cats)) if union_cats else 0.0
+
+            # Author affinity: direct author match gets a strong boost.
+            author_match = 1.0 if target_authors and sim_authors and (target_authors & sim_authors) else 0.0
+
+            # Year proximity: closer publication years are usually more relevant.
+            if target_year is not None and sim_year is not None:
+                year_diff = abs(target_year - sim_year)
+                year_proximity = max(0.0, 1.0 - (year_diff / 20.0))
+            else:
+                year_proximity = 0.0
+
+            # Title and description overlap for semantic surface alignment.
+            title_overlap = (len(target_title_tokens & sim_title_tokens) / len(target_title_tokens | sim_title_tokens)) if (target_title_tokens or sim_title_tokens) else 0.0
+            desc_overlap = (len(target_desc_tokens & sim_desc_tokens) / len(target_desc_tokens | sim_desc_tokens)) if (target_desc_tokens or sim_desc_tokens) else 0.0
+
+            rating = float(sim_book.get('average_rating', 0) or 0)
+            ratings_count = int(sim_book.get('ratings_count', 0) or 0)
+            quality_score = min(1.0, (rating / 5.0) * (math.log1p(ratings_count) / 12.0))
+
+            # Weighted blend: keep base score dominant, then refine with metadata.
+            rerank_score = (
+                0.45 * float(base_score) +
+                0.20 * category_overlap +
+                0.12 * author_match +
+                0.08 * year_proximity +
+                0.07 * title_overlap +
+                0.05 * desc_overlap +
+                0.03 * quality_score
+            )
+            reranked.append((sim_isbn, rerank_score))
+
+        reranked.sort(key=lambda x: x[1], reverse=True)
+        return reranked
     
     # ============= API Methods =============
     
@@ -158,22 +229,30 @@ class BookStore:
         """Get a single book by ISBN (O(1))."""
         return self.books_by_isbn.get(isbn)
     
-    def get_similar_books(self, isbn: str, limit: int = 50) -> List[Dict]:
-        """Get similar books with scores (lazy-loads recommendations)."""
+    def get_similar_books(self, isbn: str, limit: int = 100) -> List[Dict]:
+        """Get similar books with reranked scores (lazy-loads recommendations)."""
         # Load recommendations on first access
         if not self.recommendations and self.recommendations_path:
             self._lazy_load_recommendations()
         
         if isbn not in self.recommendations:
             return []
+
+        target_book = self.get_book(isbn)
+        if not target_book:
+            return []
         
-        similar_data = self.recommendations[isbn][:limit]
+        # Take top 100 precomputed candidates, then rerank online.
+        candidate_data = self.recommendations[isbn][:100]
+        reranked_data = self._rerank_similar_candidates(target_book, candidate_data)
+        final_data = reranked_data[: min(limit, 100)]
+        
         return [
             {
                 'book': self.books_by_isbn.get(sim_isbn),
                 'similarity_score': score,
             }
-            for sim_isbn, score in similar_data
+            for sim_isbn, score in final_data
             if sim_isbn in self.books_by_isbn
         ]
     
