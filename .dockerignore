@@ -1,0 +1,35 @@
+# Large data directories - downloaded at runtime from S3
+app/data/pdfs/
+app/data/csv/
+vector_store/
+
+# Archive files
+*.tar.gz
+*.gz
+
+# Vector store files
+*.npy
+*.index
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+.pytest_cache/
+*.egg-info/
+dist/
+build/
+
+# Local env
+.env
+.venv/
+venv/
+env/
+
+# Mac junk
+.DS_Store
+._*
+
+# Dev/test files
+*.log
+.git/
