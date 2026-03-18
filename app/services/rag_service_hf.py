@@ -4,8 +4,11 @@ from sentence_transformers import SentenceTransformer
 from huggingface_hub import InferenceClient
 import os
 import re
+import ast
+import boto3
 import warnings
 from dotenv import load_dotenv
+from app.services.cache_manager import register_file
 from app.services.utils import normalize_to_filename
 
 load_dotenv()
@@ -29,9 +32,71 @@ class RAGServiceHF:
             self.model = SentenceTransformer("all-MiniLM-L6-v2")
         return self.model
 
+    def _get_s3_client(self):
+        return boto3.client(
+            "s3",
+            aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
+            aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
+            region_name=os.environ.get("AWS_REGION", "us-east-1"),
+        )
+
+    def _download_book_index(self, book_id):
+        bucket = os.environ.get("S3_BUCKET")
+        if not bucket:
+            print("⚠️ S3_BUCKET not set, cannot download index.")
+            return
+
+        s3 = self._get_s3_client()
+        os.makedirs("vector_store", exist_ok=True)
+
+        # Generate naming candidates to try
+        # e.g. alices_adventures_in_wonderland -> Alices_Adventures_In_Wonderland
+        title_case_id = "_".join(word.capitalize() for word in book_id.split("_"))
+
+        for ext in [".index", "_chunks.npy"]:
+            local_path = f"vector_store/{book_id}{ext}"
+            if os.path.exists(local_path):
+                print(f"✅ Already cached: {local_path}")
+                continue
+
+            candidates = [
+                f"vector_store/{book_id}{ext}",          # lowercase
+                f"vector_store/{title_case_id}{ext}",    # Title_Case
+            ]
+
+            downloaded = False
+            for s3_key in candidates:
+                try:
+                    print(f"⬇️ Trying {s3_key}...")
+                    s3.download_file(bucket, s3_key, local_path)
+                    print(f"✅ Downloaded {s3_key}")
+                    register_file(local_path)
+                    downloaded = True
+                    break
+                except Exception:
+                    continue
+
+            if not downloaded:
+                print(f"❌ Could not find {book_id}{ext} on S3")
+                # Clean up partial download
+                other_ext = "_chunks.npy" if ext == ".index" else ".index"
+                other_path = f"vector_store/{book_id}{other_ext}"
+                if os.path.exists(other_path):
+                    os.remove(other_path)
+                    print(f"🗑️ Cleaned up partial: {other_path}")
+                return
+
     def load_index(self, book_id):
+        print(f"🔍 Loading index for book_id: '{book_id}'")
         index_path = f"vector_store/{book_id}.index"
         chunks_path = f"vector_store/{book_id}_chunks.npy"
+        print(f"🔍 Looking for: {index_path}")
+        index_path = f"vector_store/{book_id}.index"
+        chunks_path = f"vector_store/{book_id}_chunks.npy"
+
+        # Download from S3 if not available locally
+        if not os.path.exists(index_path) or not os.path.exists(chunks_path):
+            self._download_book_index(book_id)
 
         if not os.path.exists(index_path) or not os.path.exists(chunks_path):
             return None, None
@@ -74,12 +139,9 @@ class RAGServiceHF:
         return 7
 
     def _filter_by_llm_relevance(self, question, chunks_with_indices):
-        """Use LLM to evaluate which chunks are ESSENTIAL to answer the question.
-        Prefer fewer, higher-quality references over many mediocre ones."""
         if not chunks_with_indices:
             return []
 
-        # Build evaluation prompt with stricter criteria
         chunks_text = "\n\n".join(
             f"[CHUNK {i}]\n{c['text']}"
             for i, c in enumerate(chunks_with_indices)
@@ -105,19 +167,14 @@ If no chunks are essential, return an empty list: []
             messages = [{"role": "user", "content": eval_prompt}]
             response = self.llm.chat_completion(messages, max_tokens=100)
             response_text = response.choices[0].message.content.strip()
-            # Parse the list from the response
-            import ast
             relevant_indices = ast.literal_eval(response_text)
             if not isinstance(relevant_indices, list):
                 relevant_indices = []
-            # Cap at 7 as a safety limit
             relevant_indices = relevant_indices[:7]
         except Exception as e:
             print(f"Warning: LLM relevance filter failed: {e}, returning top 3 chunks")
-            # Fallback: return only top 3 chunks if filter fails
             relevant_indices = list(range(min(3, len(chunks_with_indices))))
 
-        # Return only the relevant chunks
         return [chunks_with_indices[i] for i in relevant_indices if i < len(chunks_with_indices)]
 
     def search_chunks(self, question, index, chunks, k=20):
@@ -191,8 +248,6 @@ If no chunks are essential, return an empty list: []
             }
 
         all_chunks = self.search_chunks(question, index, chunks, k)
-
-        # Use LLM to filter for actual relevance
         relevant_chunks = self._filter_by_llm_relevance(question, all_chunks)
 
         if not relevant_chunks:
@@ -220,13 +275,12 @@ If no chunks are essential, return an empty list: []
                 "sources": []
             }
 
-
         sources = [
             {"text": c["text"], "page": c["page"]}
             for c in relevant_chunks
             if c["page"] is not None
         ]
-        sources = sources[: self._source_cap_from_answer(answer)]
+        sources = sources[:self._source_cap_from_answer(answer)]
 
         return {
             "answer": answer,

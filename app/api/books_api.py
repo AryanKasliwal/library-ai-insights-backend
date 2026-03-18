@@ -7,76 +7,83 @@ Endpoints:
 - GET /api/stats - Get system statistics
 """
 
-
 from fastapi import APIRouter, Query, HTTPException, Request
+from fastapi.responses import FileResponse
 from typing import List, Optional, Dict
 from pydantic import BaseModel
 from app.api.rag import ChatMessage, get_session_id, store_and_reply, clear_history, get_chat_from_history
 import os
+import glob
 import difflib
-from app.services.book_store import BookStore
-from app.services.utils import normalize_to_filename
-
-router = APIRouter(tags=["books"])
-# Global book store (initialized at app startup)
-
 import boto3
 from botocore.exceptions import ClientError
+from app.services.book_store import BookStore
+from app.services.utils import normalize_to_filename
+from app.services.cache_manager import register_file
+
+router = APIRouter(tags=["books"])
 
 S3_BUCKET = os.environ.get("S3_BUCKET")
-S3_PREFIX = os.environ.get("S3_Bucket", "pdfs/")  # folder inside bucket if any
-
-
-from fastapi.responses import FileResponse
-import glob
-
+S3_PREFIX = os.environ.get("S3_PDF_PREFIX", "pdfs/")
 PDF_DIR = "app/data/pdfs"
 
-@router.get("/pdf/{book_name}")
-def serve_pdf(book_name: str):
-    """Serve PDF file directly from local storage."""
-    book_saved_name = normalize_to_filename(book_name)
-    print(book_saved_name)
-    pdf_path = f"{PDF_DIR}/{book_saved_name}.pdf"
-    
-    if not os.path.exists(pdf_path):
-        # Try to find it with glob in case casing differs
-        matches = glob.glob(f"{PDF_DIR}/{book_saved_name}*.pdf")
-        if matches:
-            pdf_path = matches[0]
-        else:
-            raise HTTPException(status_code=404, detail=f"PDF not found for {book_name}")
-    
-    return FileResponse(
-        path=pdf_path,
-        media_type="application/pdf",
-        headers={"Content-Disposition": f"inline; filename={book_name}.pdf"}
-    )
 
-
-def get_s3_client():
+def _get_s3_client():
     return boto3.client(
         "s3",
         aws_access_key_id=os.environ.get("AWS_ACCESS_KEY_ID"),
         aws_secret_access_key=os.environ.get("AWS_SECRET_ACCESS_KEY"),
-        region_name=os.environ.get("AWS_REGION", "us-east-1")
+        region_name=os.environ.get("AWS_REGION", "us-east-1"),
     )
+@router.get("/pdf/{book_name}")
+def serve_pdf(book_name: str):
+    """Serve PDF file, downloading from S3 on demand if not cached locally."""
+    book_saved_name = normalize_to_filename(book_name)
+    pdf_path = f"{PDF_DIR}/{book_saved_name}.pdf"
+
+    if not os.path.exists(pdf_path):
+        matches = glob.glob(f"{PDF_DIR}/{book_saved_name}*.pdf")
+        if matches:
+            pdf_path = matches[0]
+        else:
+            os.makedirs(PDF_DIR, exist_ok=True)
+            s3 = _get_s3_client()
+            s3_key = f"pdfs/{book_saved_name}.pdf"
+            try:
+                print(f"⬇️ Downloading PDF {s3_key} from S3...")
+                s3.download_file(S3_BUCKET, s3_key, pdf_path)
+                print(f"✅ PDF downloaded: {book_saved_name}")
+                register_file(pdf_path)  # register for cache expiry
+            except Exception as e:
+                print(f"❌ PDF download failed for {s3_key}: {e}")
+                raise HTTPException(
+                    status_code=404,
+                    detail=f"PDF not found for '{book_name}': {e}"
+                )
+
+    return FileResponse(
+        path=pdf_path,
+        media_type="application/pdf",
+        headers={"Content-Disposition": f"inline; filename={book_saved_name}.pdf"}
+    )
+
 
 @router.get("/pdf-url/{book_key}")
 def get_pdf_url(book_key: str):
     """Returns a presigned S3 URL for the book PDF."""
-    s3 = get_s3_client()
+    s3 = _get_s3_client()
     s3_key = f"{S3_PREFIX}{book_key}.pdf"
 
     try:
         url = s3.generate_presigned_url(
             "get_object",
             Params={"Bucket": S3_BUCKET, "Key": s3_key},
-            ExpiresIn=3600  # 1 hour
+            ExpiresIn=3600
         )
         return {"url": url}
     except ClientError as e:
         return {"url": None, "error": str(e)}
+
 
 # ============= Chat Endpoints =============
 
@@ -91,11 +98,14 @@ async def chat_endpoint(payload: ChatMessage, request: Request):
         "history": history
     }
 
+
 @router.post("/chat/clear")
 async def clear_chat_history(request: Request):
     session_id = get_session_id(request)
     clear_history(session_id)
     return {"status": "cleared"}
+
+
 _store: Optional[BookStore] = None
 
 
@@ -108,26 +118,13 @@ async def get_chat_history(book_name: str, request: Request):
 # ============= Pagination & Search Helpers =============
 
 def _paginate_results(results: List[Dict], page: int = 1, limit: int = 10) -> Dict:
-    """Paginate results and return with metadata.
-    
-    Args:
-        results: Full list of results
-        page: Page number (1-indexed)
-        limit: Results per page
-    
-    Returns:
-        Dict with paginated results and pagination metadata
-    """
+    """Paginate results and return with metadata."""
     total = len(results)
-    total_pages = max(1, (total + limit - 1) // limit)  # ceiling division
-    
-    # Allow page to be any value; if out of range, return empty list
-    page = max(1, page)  # Ensure page >= 1
-    
+    total_pages = max(1, (total + limit - 1) // limit)
+    page = max(1, page)
     start_idx = (page - 1) * limit
     end_idx = start_idx + limit
     paginated = results[start_idx:end_idx]
-    
     return {
         'results': paginated,
         'pagination': {
@@ -152,61 +149,54 @@ def _safe_int(value) -> Optional[int]:
 
 def _detect_search_type(query: str, store: BookStore) -> str:
     """Auto-detect search type (title, author, or category).
-    
+
     Uses heuristics to guess the most likely search type.
     Returns: 'title', 'author', or 'category'
     """
-    query_lower = query.lower().strip()
-    
-    # Check if it matches a known author (simple heuristic: contains common author names)
     author_results = store.search_by_author(query)
     if author_results:
         return 'author'
-    
-    # Check if it matches a known category
+
     category_results = store.search_by_category(query)
     if category_results:
         return 'category'
-    
-    # Default to title search
+
     return 'title'
 
 
 def _smart_search(query: str, store: BookStore) -> List[Dict]:
     """Perform smart search across title, author, and category.
-    
+
     Combines results from all search types and deduplicates by ISBN.
     """
     seen_isbns = {}
     results = []
-    
-    # Try author search first (most specific)
+
     author_results = store.search_by_author(query)
     for book in author_results:
         isbn = book.get('isbn13') or book.get('isbn10')
         if isbn and isbn not in seen_isbns:
             seen_isbns[isbn] = True
             results.append(book)
-    
-    # Then category search (with typo tolerance)
+
     _, category_results = _resolve_category_query(query, store)
     for book in category_results:
         isbn = book.get('isbn13') or book.get('isbn10')
         if isbn and isbn not in seen_isbns:
             seen_isbns[isbn] = True
             results.append(book)
-    
-    # Finally title search (most results)
+
     title_results = store.search_by_title(query)
     for book in title_results:
         isbn = book.get('isbn13') or book.get('isbn10')
         if isbn and isbn not in seen_isbns:
             seen_isbns[isbn] = True
             results.append(book)
-    
-    # Sort by rating (most relevant first)
-    results.sort(key=lambda b: (float(b.get('average_rating', 0)), int(b.get('ratings_count', 0))), reverse=True)
-    
+
+    results.sort(
+        key=lambda b: (float(b.get('average_rating', 0)), int(b.get('ratings_count', 0))),
+        reverse=True
+    )
     return results
 
 
@@ -233,7 +223,7 @@ def _resolve_category_query(category_query: str, store: BookStore):
     return matched_category, store.search_by_category(matched_category)
 
 
-def init_book_store(csv_path: str = "app/data/csv/enriched_books.csv", 
+def init_book_store(csv_path: str = "app/data/csv/enriched_books.csv",
                     recommendations_path: str = "app/services/book_recommendations.json"):
     """Initialize global book store at application startup."""
     global _store
@@ -252,19 +242,18 @@ def get_store() -> BookStore:
 
 class BookResponse:
     """Book data for API response."""
-    
+
     @staticmethod
     def from_dict(book_dict):
         if not book_dict:
             return None
-        # Indicate presence so frontend can distinguish missing results without relying on HTTP status
         return {
             'found': True,
             'id': book_dict.get('isbn13') or book_dict.get('isbn10'),
             'isbn13': book_dict.get('isbn13', ''),
             'isbn10': book_dict.get('isbn10', ''),
             'title': book_dict.get('title', ''),
-            'author': book_dict.get('authors', ''),  # Rename for frontend
+            'author': book_dict.get('authors', ''),
             'publisher': book_dict.get('publisher', ''),
             'year': _safe_int(book_dict.get('published_year')),
             'year_str': book_dict.get('published_year', ''),
@@ -280,30 +269,45 @@ class BookResponse:
                 'medium': book_dict.get('thumbnail_m', ''),
                 'large': book_dict.get('thumbnail_l', ''),
             },
-            # Library-specific (can be filled from separate DB)
-            'available': True,  # TODO: Check from library inventory
-            'location': None,   # TODO: Get from library system
-            'callNumber': None, # TODO: Get from library system
+            'available': True,   # TODO: Check from library inventory
+            'location': None,    # TODO: Get from library system
+            'callNumber': None,  # TODO: Get from library system
         }
 
 
 # ============= API Endpoints =============
 
-# Endpoint: List books available for AI chat
 @router.get("/chat-books")
 def list_chat_books():
+    import json
+    import random
+
+    def stable_shuffle(books):
+        rng = random.Random(42)  # fixed seed = always same order
+        shuffled = books.copy()
+        rng.shuffle(shuffled)
+        return shuffled
+
+    book_list_path = "book_list.json"
+    if os.path.exists(book_list_path):
+        with open(book_list_path, "r") as f:
+            data = json.load(f)
+            return {"books": stable_shuffle(data.get("books", []))}
+
+    # Fallback: scan vector_store
     vector_store_path = "vector_store"
+    if not os.path.exists(vector_store_path):
+        return {"books": []}
     index_files = [f for f in os.listdir(vector_store_path) if f.endswith('.index')]
     book_names = []
     for fname in index_files:
         name = fname.replace('.index', '')
         name = name.lstrip('_')
         name = name.replace('_', ' ')
-        # Remove leading '. ' if present
         if name.startswith('. '):
             name = name[2:]
         book_names.append(name)
-    return {"books": book_names}
+    return {"books": stable_shuffle(book_names)}
 
 
 @router.get("/search")
@@ -316,14 +320,13 @@ def smart_search(
     genre: Optional[str] = Query(None, description="Filter by genre/category"),
 ):
     """Smart search across all book data (title, author, category).
-    
+
     Auto-detects search type and combines results, then paginates.
     Returns top 10 results per page by rating.
-    
+
     Example: GET /api/books/search?q=python&page=1&limit=10
     """
     store = get_store()
-
     query = (q or "").strip()
 
     def _apply_filters(books):
@@ -331,15 +334,12 @@ def smart_search(
         if year is not None:
             filtered = [b for b in filtered if str(b.get('published_year', '')) == str(year)]
         if book_type is not None:
-            # Assume book_type is stored in a 'type' or similar field, fallback to empty string
             filtered = [b for b in filtered if b.get('type', '').lower() == book_type.lower()]
         if genre is not None:
-            # Check if genre/category is in the book's categories
             filtered = [b for b in filtered if genre.lower() in (b.get('categories', '') or '').lower()]
         return filtered
 
     if not query:
-        # No search query provided: return most recent books across catalog
         unique_books = {}
         for book in store.books_by_isbn.values():
             isbn = book.get('isbn13') or book.get('isbn10')
@@ -353,7 +353,6 @@ def smart_search(
             reverse=True,
         )
 
-        # Apply filters before pagination
         filtered_results = _apply_filters(all_results)
         book_responses = [BookResponse.from_dict(b) for b in filtered_results]
         paginated = _paginate_results(book_responses, page=page, limit=limit)
@@ -367,8 +366,6 @@ def smart_search(
             'pagination': paginated['pagination'],
         }
 
-    # Detect typo-corrected category match so frontend can show
-    # "Showing results for <resolved_category>"
     exact_category_results = store.search_by_category(query)
     resolved_category, resolved_category_results = _resolve_category_query(query, store)
     category_correction_applied = (
@@ -377,17 +374,14 @@ def smart_search(
         and resolved_category.lower() != query.lower().strip()
     )
 
-    # Perform smart search
     all_results = _smart_search(query, store)
-    # Apply filters before pagination
     filtered_results = _apply_filters(all_results)
-    # Convert to response format
     book_responses = [BookResponse.from_dict(b) for b in filtered_results]
-    # Paginate
     paginated = _paginate_results(book_responses, page=page, limit=limit)
+
     return {
         'query': query,
-        'search_type': 'smart',  # Indicates multi-source search
+        'search_type': 'smart',
         'resolved_category': resolved_category if category_correction_applied else None,
         'category_correction_applied': category_correction_applied,
         'results': paginated['results'],
@@ -398,7 +392,7 @@ def smart_search(
 @router.get("/{isbn}")
 def get_book(isbn: str):
     """Get a single book by ISBN.
-    
+
     Example: GET /api/books/9780439785969
     """
     try:
@@ -408,17 +402,15 @@ def get_book(isbn: str):
         print(f"  Looking for ISBN {isbn}: {book is not None}")
         if book:
             print(f"  Found: {book['title'][:30]}")
-        
+
         if not book:
-            # Return 200 with explicit not-found payload instead of HTTP 404
             return {
                 'found': False,
                 'isbn': isbn,
                 'message': f"Book not found: {isbn}",
             }
-        
+
         resp = BookResponse.from_dict(book)
-        # Ensure the response explicitly marks presence
         if isinstance(resp, dict):
             resp['found'] = True
         return resp
@@ -430,16 +422,15 @@ def get_book(isbn: str):
 @router.get("/{isbn}/similar")
 def get_similar_books(isbn: str, limit: int = Query(100, ge=1, le=100)):
     """Get similar books for a given ISBN.
-    
+
     Uses Jaccard similarity on categories + rating quality boost.
-    
+
     Example: GET /api/books/9780439785969/similar?limit=100
     """
     store = get_store()
     book = store.get_book(isbn)
 
     if not book:
-        # Return a structured not-found response instead of HTTP 404
         return {
             'found': False,
             'isbn': isbn,
@@ -449,12 +440,10 @@ def get_similar_books(isbn: str, limit: int = Query(100, ge=1, le=100)):
             'total_similar': 0,
         }
 
-    # Get the target book
     target_response = BookResponse.from_dict(book)
     if isinstance(target_response, dict):
         target_response['found'] = True
-    
-    # Get similar books
+
     similar_books = store.get_similar_books(isbn, limit=limit)
     similar_response = [
         {
@@ -463,7 +452,7 @@ def get_similar_books(isbn: str, limit: int = Query(100, ge=1, le=100)):
         }
         for item in similar_books
     ]
-    
+
     return {
         'book': target_response,
         'similar_books': similar_response,
@@ -478,14 +467,14 @@ def search_by_title(
     limit: int = Query(10, ge=1, le=100, description="Results per page"),
 ):
     """Search books by title with pagination.
-    
+
     Example: GET /api/books/search/title?q=Harry+Potter&page=1&limit=10
     """
     store = get_store()
     all_results = store.search_by_title(q)
     book_responses = [BookResponse.from_dict(b) for b in all_results]
     paginated = _paginate_results(book_responses, page=page, limit=limit)
-    
+
     return {
         'query': q,
         'search_type': 'title',
@@ -501,14 +490,14 @@ def search_by_author(
     limit: int = Query(10, ge=1, le=100, description="Results per page"),
 ):
     """Search books by author with pagination.
-    
+
     Example: GET /api/books/search/author?q=J.K.+Rowling&page=1&limit=10
     """
     store = get_store()
     all_results = store.search_by_author(q)
     book_responses = [BookResponse.from_dict(b) for b in all_results]
     paginated = _paginate_results(book_responses, page=page, limit=limit)
-    
+
     return {
         'query': q,
         'search_type': 'author',
@@ -524,13 +513,12 @@ def search_by_category(
     limit: int = Query(10, ge=1, le=100, description="Results per page"),
 ):
     """Search books by category with pagination.
-    
+
     Example: GET /api/books/search/category?category=Fiction&page=1&limit=10
     """
     store = get_store()
     resolved_category, all_results = _resolve_category_query(category, store)
 
-    # Keep sorting behavior consistent with get_books_by_category, but do not hard-cap.
     all_results.sort(
         key=lambda b: (float(b.get('average_rating', 0)), int(b.get('ratings_count', 0))),
         reverse=True,
@@ -538,7 +526,7 @@ def search_by_category(
 
     book_responses = [BookResponse.from_dict(b) for b in all_results]
     paginated = _paginate_results(book_responses, page=page, limit=limit)
-    
+
     return {
         'category': category,
         'resolved_category': resolved_category,
@@ -554,14 +542,14 @@ def get_trending(
     limit: int = Query(10, ge=1, le=100, description="Results per page"),
 ):
     """Get trending books (highest rated with most reviews) with pagination.
-    
+
     Example: GET /api/books/trending?page=1&limit=10
     """
     store = get_store()
-    all_results = store.get_top_rated_books(limit=500)  # Get more to paginate
+    all_results = store.get_top_rated_books(limit=500)
     book_responses = [BookResponse.from_dict(b) for b in all_results]
     paginated = _paginate_results(book_responses, page=page, limit=limit)
-    
+
     return {
         'search_type': 'trending',
         'results': paginated['results'],
@@ -572,7 +560,7 @@ def get_trending(
 @router.get("/stats")
 def get_stats():
     """Get BookStore statistics.
-    
+
     Example: GET /api/books/stats
     """
     store = get_store()
