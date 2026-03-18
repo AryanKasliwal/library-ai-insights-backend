@@ -13,6 +13,7 @@ RUN apt-get update && apt-get install -y \
 COPY app ./app
 COPY requirements.txt .
 
+RUN pip install torch --index-url https://download.pytorch.org/whl/cpu
 RUN apt-get update && apt-get install -y build-essential \
     && pip install --no-cache-dir -r requirements.txt \
     && apt-get remove -y build-essential \

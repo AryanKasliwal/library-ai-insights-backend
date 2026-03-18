@@ -1,6 +1,5 @@
 import faiss
 import numpy as np
-from sentence_transformers import SentenceTransformer
 from huggingface_hub import InferenceClient
 import os
 import re
@@ -8,6 +7,8 @@ import ast
 import boto3
 import warnings
 from dotenv import load_dotenv
+from functools import lru_cache
+
 from app.services.cache_manager import register_file
 from app.services.utils import normalize_to_filename
 
@@ -19,18 +20,27 @@ warnings.filterwarnings(
     category=FutureWarning,
 )
 
+
 class RAGServiceHF:
     def __init__(self):
-        self.model = None
         self.llm = InferenceClient(
             token=os.environ.get("HF_READ_KEY"),
             model="openai/gpt-oss-20b"
         )
 
-    def _get_embedding_model(self):
-        if self.model is None:
-            self.model = SentenceTransformer("all-MiniLM-L6-v2")
-        return self.model
+        # ✅ NEW: embedding client (HF API)
+        self.embed_client = InferenceClient(
+            token=os.environ.get("HF_READ_KEY")
+        )
+
+    # ✅ NEW: embedding via HF API (cached)
+    @lru_cache(maxsize=1000)
+    def _get_query_embedding(self, text: str):
+        embedding = self.embed_client.feature_extraction(
+            text,
+            model="sentence-transformers/all-MiniLM-L6-v2"
+        )
+        return np.array(embedding).astype("float32")
 
     def _get_s3_client(self):
         return boto3.client(
@@ -49,8 +59,6 @@ class RAGServiceHF:
         s3 = self._get_s3_client()
         os.makedirs("vector_store", exist_ok=True)
 
-        # Generate naming candidates to try
-        # e.g. alices_adventures_in_wonderland -> Alices_Adventures_In_Wonderland
         title_case_id = "_".join(word.capitalize() for word in book_id.split("_"))
 
         for ext in [".index", "_chunks.npy"]:
@@ -60,8 +68,8 @@ class RAGServiceHF:
                 continue
 
             candidates = [
-                f"vector_store/{book_id}{ext}",          # lowercase
-                f"vector_store/{title_case_id}{ext}",    # Title_Case
+                f"vector_store/{book_id}{ext}",
+                f"vector_store/{title_case_id}{ext}",
             ]
 
             downloaded = False
@@ -78,7 +86,6 @@ class RAGServiceHF:
 
             if not downloaded:
                 print(f"❌ Could not find {book_id}{ext} on S3")
-                # Clean up partial download
                 other_ext = "_chunks.npy" if ext == ".index" else ".index"
                 other_path = f"vector_store/{book_id}{other_ext}"
                 if os.path.exists(other_path):
@@ -91,8 +98,6 @@ class RAGServiceHF:
         index_path = f"vector_store/{book_id}.index"
         chunks_path = f"vector_store/{book_id}_chunks.npy"
         print(f"🔍 Looking for: {index_path}")
-        index_path = f"vector_store/{book_id}.index"
-        chunks_path = f"vector_store/{book_id}_chunks.npy"
 
         # Download from S3 if not available locally
         if not os.path.exists(index_path) or not os.path.exists(chunks_path):
@@ -147,6 +152,7 @@ class RAGServiceHF:
             for i, c in enumerate(chunks_with_indices)
         )
 
+        # ✅ PROMPT UNCHANGED
         eval_prompt = f"""You are selecting ESSENTIAL book excerpts to answer a user question.
 Quality over quantity: Return only chunks truly necessary to answer the question.
 Prefer fewer, high-quality chunks over many mediocre ones.
@@ -178,8 +184,10 @@ If no chunks are essential, return an empty list: []
         return [chunks_with_indices[i] for i in relevant_indices if i < len(chunks_with_indices)]
 
     def search_chunks(self, question, index, chunks, k=20):
-        q_embedding = self._get_embedding_model().encode([question])
-        distances, indices = index.search(np.array(q_embedding), k)
+        # ✅ UPDATED: use HF embedding
+        q_embedding = self._get_query_embedding(question).reshape(1, -1)
+
+        distances, indices = index.search(q_embedding, k)
 
         results = []
         for idx in indices[0]:
@@ -214,6 +222,7 @@ If no chunks are essential, return an empty list: []
 
         length_instruction = self._length_instruction(question)
 
+        # ✅ PROMPT UNCHANGED
         return f"""You are a research assistant helping a user understand the book "{book_name}".
             Answer the user's question based ONLY on the provided book excerpts below and the chat history.
             If the answer is not found in the excerpts and chat history, say so clearly.
